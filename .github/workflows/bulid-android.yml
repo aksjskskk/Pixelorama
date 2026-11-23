@@ -7,7 +7,7 @@ on:
 
 env:
   # تأكد من مطابقة هذا الإصدار مع رقم إصدار Godot الموجود في ملف project.godot لديك
-  GODOT_VERSION: "4.4.1-stable"
+  GODOT_VERSION: "4.7"
 
 jobs:
   build-android:

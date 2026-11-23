@@ -3,7 +3,7 @@ extends Node
 ## Virtual Mouse (Trackpad-style cursor) Autoload for Android in Pixelorama.
 ## Inspired by Godot Engine's AndroidInputHandler::process_virtual_mouse_touch (PR #118253).
 
-const CURSOR_TEXTURE_PATH := "res://assets/graphics/virtual_cursor.png"
+const CURSOR_TEXTURE_PATH := "res://assets/graphics/virtual_cursor.svg"
 const FALLBACK_CURSOR_TEXTURE_PATH := "res://assets/graphics/cursor.png"
 const CONFIG_PATH := "user://virtual_mouse.cfg"
 

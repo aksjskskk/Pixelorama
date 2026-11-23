@@ -1,18 +1,24 @@
 extends Node
 
 ## Virtual Mouse (Trackpad-style cursor) Autoload for Android in Pixelorama.
-## Inspired by Godot Engine's AndroidInputHandler::process_virtual_mouse_touch (PR #118253).
+## Fixes DPI/UI scale coordinate offset via get_screen_transform() and adds
+## seamless Two-Finger Pan (Middle Mouse), Pinch-to-Zoom (Wheel), and 1-Finger Tap-Drag.
 
-const CURSOR_TEXTURE_PATH := "res://assets/graphics/virtual_cursor.svg"
+const CURSOR_SVG_PATH := "res://assets/graphics/virtual_cursor.svg"
+const CURSOR_PNG_PATH := "res://assets/graphics/virtual_cursor.png"
 const FALLBACK_CURSOR_TEXTURE_PATH := "res://assets/graphics/cursor.png"
 const CONFIG_PATH := "user://virtual_mouse.cfg"
 
 const TAP_THRESHOLD_MS: int = 250
-const DOUBLE_TAP_THRESHOLD_MS: int = 400
+const DOUBLE_TAP_THRESHOLD_MS: int = 380
 const TAP_MOVE_THRESHOLD_PX: float = 20.0
+const TAP_DRAG_MOVE_THRESHOLD_PX: float = 10.0
 const DOUBLE_TAP_SLOP_PX: float = 40.0
-const SCROLL_THRESHOLD_PX: float = 8.0
-const SCROLL_PIXELS_PER_STEP: float = 40.0
+
+const PAN_START_THRESHOLD_PX: float = 8.0
+const PINCH_START_THRESHOLD_PX: float = 16.0
+const PINCH_PIXELS_PER_STEP: float = 26.0
+const SECONDARY_STILL_THRESHOLD_PX: float = 12.0
 
 ## Set to true if you only want the virtual cursor visible/active on Android devices.
 const ANDROID_ONLY := false
@@ -21,7 +27,7 @@ const ANDROID_ONLY := false
 var sensitivity: float = 1.5
 ## Optional offset from the cursor texture's top-left corner to its active tip.
 var cursor_hotspot: Vector2 = Vector2.ZERO
-## Current virtual cursor position in viewport coordinates.
+## Current virtual cursor position in root viewport coordinates.
 var virtual_cursor_pos: Vector2 = Vector2.ZERO
 
 var _canvas_layer: CanvasLayer
@@ -45,14 +51,21 @@ var _secondary_moved: bool = false
 
 # Gesture state
 var _is_dragging: bool = false
-var _is_scrolling: bool = false
+var _is_pan_zoom: bool = false
+var _is_middle_pressed: bool = false
 var _had_secondary_touch: bool = false
-var _scroll_accum: Vector2 = Vector2.ZERO
 var _pressed_button_mask: int = 0
 
-# Double-tap state
+# Two-finger pan & pinch tracking
+var _two_finger_start_dist: float = 0.0
+var _last_two_finger_dist: float = 0.0
+var _last_midpoint: Vector2 = Vector2.ZERO
+var _pinch_accum: float = 0.0
+
+# Double-tap & 1-finger tap-drag state
 var _last_tap_time_ms: int = 0
 var _last_tap_pos: Vector2 = Vector2.ZERO
+var _pending_tap_drag: bool = false
 
 
 func _ready() -> void:
@@ -125,15 +138,16 @@ func _setup_ui() -> void:
 func _setup_sensitivity_ui() -> void:
 	var container := VBoxContainer.new()
 	container.name = "SensitivityContainer"
+	container.layout_direction = Control.LAYOUT_DIRECTION_LTR
 	container.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	container.anchor_left = 1.0
 	container.anchor_right = 1.0
 	container.anchor_top = 0.0
 	container.anchor_bottom = 0.0
-	container.offset_left = -170.0
-	container.offset_right = -16.0
-	container.offset_top = 48.0
-	container.offset_bottom = 120.0
+	container.offset_left = -140.0
+	container.offset_right = -12.0
+	container.offset_top = 40.0
+	container.offset_bottom = 110.0
 	_canvas_layer.add_child(container)
 
 	var toggle_btn := Button.new()
@@ -151,7 +165,7 @@ func _setup_sensitivity_ui() -> void:
 	slider.step = 0.1
 	slider.value = sensitivity
 	slider.focus_mode = Control.FOCUS_NONE
-	slider.custom_minimum_size = Vector2(140.0, 28.0)
+	slider.custom_minimum_size = Vector2(120.0, 26.0)
 	panel.add_child(slider)
 
 	toggle_btn.pressed.connect(func() -> void:
@@ -178,19 +192,15 @@ func _save_settings() -> void:
 
 
 func _load_cursor_texture() -> Texture2D:
-	if ResourceLoader.exists(CURSOR_TEXTURE_PATH):
-		var loaded := load(CURSOR_TEXTURE_PATH)
-		if loaded is Texture2D:
-			return loaded
-	if ResourceLoader.exists(FALLBACK_CURSOR_TEXTURE_PATH):
-		var fallback := load(FALLBACK_CURSOR_TEXTURE_PATH)
-		if fallback is Texture2D:
-			return fallback
+	for path: String in [CURSOR_SVG_PATH, CURSOR_PNG_PATH, FALLBACK_CURSOR_TEXTURE_PATH]:
+		if ResourceLoader.exists(path):
+			var loaded := load(path)
+			if loaded is Texture2D:
+				return loaded
 	return _create_default_cursor_texture()
 
 
 func _create_default_cursor_texture() -> ImageTexture:
-	# Simple white arrow with black outline as a safe fallback until virtual_cursor.png is added.
 	var img := Image.create_empty(16, 16, false, Image.FORMAT_RGBA8)
 	img.fill(Color(0, 0, 0, 0))
 	for y in range(14):
@@ -219,6 +229,20 @@ func _clamp_to_viewport(pos: Vector2) -> Vector2:
 	)
 
 
+func _to_screen_pos(viewport_pos: Vector2) -> Vector2:
+	var viewport := get_viewport()
+	if not viewport:
+		return viewport_pos
+	return viewport.get_screen_transform() * viewport_pos
+
+
+func _to_screen_delta(viewport_delta: Vector2) -> Vector2:
+	var viewport := get_viewport()
+	if not viewport:
+		return viewport_delta
+	return viewport.get_screen_transform().basis_xform(viewport_delta)
+
+
 func _update_cursor_visual() -> void:
 	if _cursor_rect:
 		_cursor_rect.position = virtual_cursor_pos - cursor_hotspot
@@ -235,20 +259,30 @@ func _handle_touch_press(event: InputEventScreenTouch) -> void:
 		_primary_press_time_ms = now_ms
 		_primary_moved = false
 		_had_secondary_touch = false
-		_is_scrolling = false
-		_scroll_accum = Vector2.ZERO
+		_is_pan_zoom = false
+		_pinch_accum = 0.0
+
+		# Check if this touch immediately follows a quick tap (enables 1-finger Tap-and-Drag).
+		_pending_tap_drag = (
+			_last_tap_time_ms > 0
+			and (now_ms - _last_tap_time_ms) < DOUBLE_TAP_THRESHOLD_MS
+			and event.position.distance_to(_last_tap_pos) < DOUBLE_TAP_SLOP_PX
+		)
 	elif _secondary_finger_id == -1 and event.index != _primary_finger_id:
+		_pending_tap_drag = false
 		_secondary_finger_id = event.index
 		_secondary_press_pos = event.position
 		_secondary_last_pos = event.position
 		_secondary_press_time_ms = now_ms
 		_secondary_moved = false
 		_had_secondary_touch = true
-		_is_scrolling = false
-		_scroll_accum = Vector2.ZERO
-		# Anchor primary finger at the moment secondary finger touches down so drag/scroll
-		# thresholds measure movement after both fingers are present.
+		_is_pan_zoom = false
+		_pinch_accum = 0.0
+
 		_primary_drag_origin = _primary_last_pos
+		_two_finger_start_dist = _primary_last_pos.distance_to(_secondary_last_pos)
+		_last_two_finger_dist = _two_finger_start_dist
+		_last_midpoint = (_primary_last_pos + _secondary_last_pos) * 0.5
 
 
 func _handle_touch_drag(event: InputEventScreenDrag) -> void:
@@ -262,8 +296,18 @@ func _handle_touch_drag(event: InputEventScreenDrag) -> void:
 		):
 			_primary_moved = true
 
-		# Single-finger pointer movement
+		# Single-finger movement or 1-finger Tap-and-Drag
 		if _secondary_finger_id == -1:
+			if (
+				_pending_tap_drag
+				and not _is_dragging
+				and event.position.distance_to(_primary_press_pos) > TAP_DRAG_MOVE_THRESHOLD_PX
+			):
+				_pending_tap_drag = false
+				_last_tap_time_ms = 0
+				_is_dragging = true
+				_send_mouse_button(MOUSE_BUTTON_LEFT, true, false)
+
 			if finger_delta != Vector2.ZERO:
 				_move_cursor(finger_delta * sensitivity)
 			return
@@ -272,9 +316,8 @@ func _handle_touch_drag(event: InputEventScreenDrag) -> void:
 		if _is_dragging:
 			if finger_delta != Vector2.ZERO:
 				_move_cursor(finger_delta * sensitivity)
-		elif _is_scrolling:
-			_scroll_accum += finger_delta * 0.5
-			_emit_scroll_events()
+		elif _is_pan_zoom:
+			_handle_pan_zoom_update()
 		else:
 			_evaluate_two_finger_gesture(true, finger_delta)
 
@@ -289,11 +332,9 @@ func _handle_touch_drag(event: InputEventScreenDrag) -> void:
 			_secondary_moved = true
 
 		if _is_dragging:
-			# Ignore minor resting-finger jitter while dragging with the primary finger.
 			return
-		elif _is_scrolling:
-			_scroll_accum += finger_delta * 0.5
-			_emit_scroll_events()
+		elif _is_pan_zoom:
+			_handle_pan_zoom_update()
 		else:
 			_evaluate_two_finger_gesture(false, finger_delta)
 
@@ -301,36 +342,111 @@ func _handle_touch_drag(event: InputEventScreenDrag) -> void:
 func _evaluate_two_finger_gesture(is_primary: bool, current_delta: Vector2) -> void:
 	var primary_delta := _primary_last_pos - _primary_drag_origin
 	var secondary_delta := _secondary_last_pos - _secondary_press_pos
-	var avg_delta := (primary_delta + secondary_delta) * 0.5
-	var min_finger_move := SCROLL_THRESHOLD_PX * 0.5
+	var curr_dist := _primary_last_pos.distance_to(_secondary_last_pos)
+	var dist_change := absf(curr_dist - _two_finger_start_dist)
 
-	# Two-Finger Scroll: both fingers move in the same direction and average exceeds 8px.
-	if (
+	var start_midpoint := (_primary_drag_origin + _secondary_press_pos) * 0.5
+	var curr_midpoint := (_primary_last_pos + _secondary_last_pos) * 0.5
+	var midpoint_delta := curr_midpoint - start_midpoint
+
+	var is_pinch := dist_change > PINCH_START_THRESHOLD_PX
+	var is_two_finger_pan := (
 		primary_delta.dot(secondary_delta) > 0.0
-		and primary_delta.length() > min_finger_move
-		and secondary_delta.length() > min_finger_move
-		and avg_delta.length() > SCROLL_THRESHOLD_PX
-	):
-		_is_scrolling = true
-		_scroll_accum = avg_delta
-		_emit_scroll_events()
+		and primary_delta.length() > 6.0
+		and secondary_delta.length() > 6.0
+		and midpoint_delta.length() > PAN_START_THRESHOLD_PX
+	)
+
+	# Two-Finger Pan & Pinch-to-Zoom (works in any tool without switching tools).
+	if is_pinch or is_two_finger_pan:
+		_is_pan_zoom = true
+		_last_midpoint = curr_midpoint
+		_last_two_finger_dist = curr_dist
+		_pinch_accum = curr_dist - _two_finger_start_dist
+		_start_pan()
+		if midpoint_delta != Vector2.ZERO:
+			_pan_canvas(midpoint_delta)
+		_process_pinch_zoom()
 		return
 
-	# Drag & Drop / Continuous Drawing: primary finger moves > 20px while secondary is held.
-	if is_primary and primary_delta.length() > TAP_MOVE_THRESHOLD_PX:
+	# Two-Finger Left-Drag: hold secondary finger still while moving primary finger.
+	if (
+		is_primary
+		and primary_delta.length() > TAP_MOVE_THRESHOLD_PX
+		and secondary_delta.length() < SECONDARY_STILL_THRESHOLD_PX
+	):
 		_is_dragging = true
 		_send_mouse_button(MOUSE_BUTTON_LEFT, true, false)
 		if current_delta != Vector2.ZERO:
 			_move_cursor(current_delta * sensitivity)
 
 
+func _handle_pan_zoom_update() -> void:
+	var curr_midpoint := (_primary_last_pos + _secondary_last_pos) * 0.5
+	var pan_delta := curr_midpoint - _last_midpoint
+	_last_midpoint = curr_midpoint
+
+	if pan_delta != Vector2.ZERO:
+		_start_pan()
+		_pan_canvas(pan_delta)
+
+	var curr_dist := _primary_last_pos.distance_to(_secondary_last_pos)
+	_pinch_accum += (curr_dist - _last_two_finger_dist)
+	_last_two_finger_dist = curr_dist
+	_process_pinch_zoom()
+
+
+func _process_pinch_zoom() -> void:
+	while _pinch_accum >= PINCH_PIXELS_PER_STEP:
+		_send_zoom_wheel(MOUSE_BUTTON_WHEEL_UP)
+		_pinch_accum -= PINCH_PIXELS_PER_STEP
+	while _pinch_accum <= -PINCH_PIXELS_PER_STEP:
+		_send_zoom_wheel(MOUSE_BUTTON_WHEEL_DOWN)
+		_pinch_accum += PINCH_PIXELS_PER_STEP
+
+
+func _send_zoom_wheel(button_index: MouseButton) -> void:
+	var was_panning := _is_middle_pressed
+	if was_panning:
+		_stop_pan()
+	_send_wheel_step(button_index)
+	if was_panning:
+		_start_pan()
+
+
+func _start_pan() -> void:
+	if not _is_middle_pressed:
+		_is_middle_pressed = true
+		_send_mouse_button(MOUSE_BUTTON_MIDDLE, true, false)
+
+
+func _stop_pan() -> void:
+	if _is_middle_pressed:
+		_is_middle_pressed = false
+		_send_mouse_button(MOUSE_BUTTON_MIDDLE, false, false)
+
+
+func _end_pan_zoom() -> void:
+	_stop_pan()
+	_is_pan_zoom = false
+	_pinch_accum = 0.0
+
+
+func _pan_canvas(pan_delta: Vector2) -> void:
+	# Keep the cursor anchored over the canvas while panning with middle mouse relative motion.
+	_send_mouse_motion(pan_delta)
+
+
 func _handle_touch_release(event: InputEventScreenTouch) -> void:
 	var now_ms := Time.get_ticks_msec()
 
 	if event.index == _primary_finger_id:
+		_pending_tap_drag = false
 		if _is_dragging:
 			_end_drag()
-		elif not _is_scrolling and not _had_secondary_touch and _secondary_finger_id == -1:
+		elif _is_pan_zoom:
+			_end_pan_zoom()
+		elif not _had_secondary_touch and _secondary_finger_id == -1:
 			var elapsed_ms := now_ms - _primary_press_time_ms
 			var total_dist := event.position.distance_to(_primary_press_pos)
 			if (
@@ -340,7 +456,6 @@ func _handle_touch_release(event: InputEventScreenTouch) -> void:
 			):
 				_perform_left_tap(now_ms, event.position)
 
-		# If secondary finger is still on screen, promote it to primary without triggering a tap.
 		if _secondary_finger_id != -1:
 			_primary_finger_id = _secondary_finger_id
 			_primary_press_pos = _secondary_press_pos
@@ -355,13 +470,12 @@ func _handle_touch_release(event: InputEventScreenTouch) -> void:
 			_primary_moved = false
 			_had_secondary_touch = false
 
-		_is_scrolling = false
-		_scroll_accum = Vector2.ZERO
-
 	elif event.index == _secondary_finger_id:
 		if _is_dragging:
 			_end_drag()
-		elif not _is_scrolling:
+		elif _is_pan_zoom:
+			_end_pan_zoom()
+		else:
 			var sec_elapsed_ms := now_ms - _secondary_press_time_ms
 			var sec_dist := event.position.distance_to(_secondary_press_pos)
 			if (
@@ -374,8 +488,7 @@ func _handle_touch_release(event: InputEventScreenTouch) -> void:
 
 		_secondary_finger_id = -1
 		_secondary_moved = false
-		_is_scrolling = false
-		_scroll_accum = Vector2.ZERO
+		_primary_moved = true
 
 
 func _perform_left_tap(now_ms: int, tap_pos: Vector2) -> void:
@@ -401,15 +514,14 @@ func _end_drag() -> void:
 
 
 func _reset_all_touch_state() -> void:
-	if _is_dragging:
-		_end_drag()
+	_pending_tap_drag = false
+	_end_drag()
+	_end_pan_zoom()
 	_primary_finger_id = -1
 	_secondary_finger_id = -1
 	_primary_moved = false
 	_secondary_moved = false
-	_is_scrolling = false
 	_had_secondary_touch = false
-	_scroll_accum = Vector2.ZERO
 
 
 func _move_cursor(scaled_delta: Vector2) -> void:
@@ -420,26 +532,12 @@ func _move_cursor(scaled_delta: Vector2) -> void:
 	_send_mouse_motion(applied_delta)
 
 
-func _emit_scroll_events() -> void:
-	while _scroll_accum.y >= SCROLL_PIXELS_PER_STEP:
-		_send_wheel_step(MOUSE_BUTTON_WHEEL_UP)
-		_scroll_accum.y -= SCROLL_PIXELS_PER_STEP
-	while _scroll_accum.y <= -SCROLL_PIXELS_PER_STEP:
-		_send_wheel_step(MOUSE_BUTTON_WHEEL_DOWN)
-		_scroll_accum.y += SCROLL_PIXELS_PER_STEP
-	while _scroll_accum.x >= SCROLL_PIXELS_PER_STEP:
-		_send_wheel_step(MOUSE_BUTTON_WHEEL_LEFT)
-		_scroll_accum.x -= SCROLL_PIXELS_PER_STEP
-	while _scroll_accum.x <= -SCROLL_PIXELS_PER_STEP:
-		_send_wheel_step(MOUSE_BUTTON_WHEEL_RIGHT)
-		_scroll_accum.x += SCROLL_PIXELS_PER_STEP
-
-
 func _send_mouse_motion(relative_delta: Vector2) -> void:
+	var screen_pos := _to_screen_pos(virtual_cursor_pos)
 	var motion_event := InputEventMouseMotion.new()
-	motion_event.position = virtual_cursor_pos
-	motion_event.global_position = virtual_cursor_pos
-	motion_event.relative = relative_delta
+	motion_event.position = screen_pos
+	motion_event.global_position = screen_pos
+	motion_event.relative = _to_screen_delta(relative_delta)
 	motion_event.button_mask = _pressed_button_mask
 	Input.parse_input_event(motion_event)
 
@@ -453,33 +551,35 @@ func _send_mouse_button(
 	else:
 		_pressed_button_mask &= ~mask_bit
 
+	var screen_pos := _to_screen_pos(virtual_cursor_pos)
 	var button_event := InputEventMouseButton.new()
 	button_event.button_index = button_index
 	button_event.pressed = pressed
 	button_event.double_click = double_click
-	button_event.position = virtual_cursor_pos
-	button_event.global_position = virtual_cursor_pos
+	button_event.position = screen_pos
+	button_event.global_position = screen_pos
 	button_event.button_mask = _pressed_button_mask
 	Input.parse_input_event(button_event)
 
 
 func _send_wheel_step(button_index: MouseButton) -> void:
+	var screen_pos := _to_screen_pos(virtual_cursor_pos)
 	var press_event := InputEventMouseButton.new()
 	press_event.button_index = button_index
 	press_event.pressed = true
 	press_event.factor = 1.0
-	press_event.position = virtual_cursor_pos
-	press_event.global_position = virtual_cursor_pos
-	press_event.button_mask = _pressed_button_mask
+	press_event.position = screen_pos
+	press_event.global_position = screen_pos
+	press_event.button_mask = 0
 	Input.parse_input_event(press_event)
 
 	var release_event := InputEventMouseButton.new()
 	release_event.button_index = button_index
 	release_event.pressed = false
 	release_event.factor = 1.0
-	release_event.position = virtual_cursor_pos
-	release_event.global_position = virtual_cursor_pos
-	release_event.button_mask = _pressed_button_mask
+	release_event.position = screen_pos
+	release_event.global_position = screen_pos
+	release_event.button_mask = 0
 	Input.parse_input_event(release_event)
 
 
